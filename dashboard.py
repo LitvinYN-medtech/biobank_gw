@@ -1,8 +1,10 @@
+cat << 'EOF' > /opt/biobank/dashboard.py
 import streamlit as st
 import psycopg2
 import pandas as pd
+from datetime import datetime, time
 
-# 1. СТРОГО НАЧАЛО: Инициализация сессии до любого вывода на экран
+# 1. Инициализация сессии до любого вывода на экран
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
     st.session_state["username"] = ""
@@ -12,12 +14,12 @@ if "authenticated" not in st.session_state:
 # Настройки интерфейса
 st.set_page_config(page_title="Журнал операций лабораторий", page_icon="🔬", layout="wide")
 
-# Проверка наличия секретов
+# Проверка наличисекретов
 if "postgres" not in st.secrets or "credentials" not in st.secrets:
     st.error("Ошибка: Файл secrets.toml не найден или заполнен неверно!")
     st.stop()
 
-# --- ЭКРАН АВТОРИЗАЦИИ (Компактный по центру) ---
+# --- ЭКРАН АВТОРИЗАЦИИ ---
 if not st.session_state["authenticated"]:
     _, col_form, _ = st.columns([1, 1.2, 1])
     with col_form:
@@ -34,7 +36,6 @@ if not st.session_state["authenticated"]:
                 if username in creds:
                     stored_pass, role, clinic_code = creds[username].split(":")
                     if password == stored_pass:
-                        # Фиксируем состояние в сессии
                         st.session_state["authenticated"] = True
                         st.session_state["username"] = username
                         st.session_state["role"] = role
@@ -46,7 +47,7 @@ if not st.session_state["authenticated"]:
                     st.error("Пользователь не найден")
     st.stop()
 
-# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ (Вызывается только после логина) ---
+# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
 @st.cache_resource
 def get_connection():
     return psycopg2.connect(**st.secrets["postgres"])
@@ -60,6 +61,8 @@ except Exception as e:
 def safe_query(query, params=None):
     with conn.cursor() as cur:
         cur.execute(query, params)
+        if cur.description is None:
+            return pd.DataFrame()
         columns = [desc[0] for desc in cur.description]
         data = cur.fetchall()
         return pd.DataFrame(data, columns=columns)
@@ -84,16 +87,19 @@ def load_filters_data(user_role, user_clinic_code):
         """
         df_struct = safe_query(struct_q, (user_clinic_code,))
         
-    if user_role == "admin":
-        dev_q = "SELECT DISTINCT device_serial FROM public.audit_trail_events WHERE occurred_at >= NOW() - INTERVAL '30 days';"
-        df_devices = safe_query(dev_q)
-    else:
-        dev_q = "SELECT DISTINCT device_serial FROM public.audit_trail_events WHERE occurred_at >= NOW() - INTERVAL '30 days' AND clinic_code = %s;"
-        df_devices = safe_query(dev_q, (user_clinic_code,))
-        
-    return df_struct, df_devices
+    return df_struct
 
-df_struct, df_devices = load_filters_data(st.session_state["role"], st.session_state["clinic_code"])
+df_struct = load_filters_data(st.session_state["role"], st.session_state["clinic_code"])
+
+# Загрузка доступных S/N устройств (теперь зависит от выбранных дат, загружаем динамически ниже)
+def load_devices_dynamic(user_role, user_clinic_code, start_dt, end_dt):
+    if user_role == "admin":
+        dev_q = "SELECT DISTINCT device_serial FROM public.audit_trail_events WHERE occurred_at BETWEEN %s AND %s;"
+        return safe_query(dev_q, (start_dt, end_dt))
+    else:
+        dev_q = "SELECT DISTINCT device_serial FROM public.audit_trail_events WHERE occurred_at BETWEEN %s AND %s AND clinic_code = %s;"
+        return safe_query(dev_q, (start_dt, end_dt, user_clinic_code))
+
 
 # --- БОКОВАЯ ПАНЕЛЬ И ФИЛЬТРЫ ---
 st.sidebar.markdown(f"👤 Юзер: **{st.session_state['username']}** ({st.session_state['role']})")
@@ -108,18 +114,37 @@ if st.sidebar.button("🔄 Обновить данные"):
     st.cache_data.clear()
     st.rerun()
 
+# 📅 НОВЫЙ БЛОК: Выбор диапазона дат (По умолчанию - за сегодня)
+today = datetime.now().date()
+date_range = st.sidebar.date_input(
+    "Выберите диапазон дат:",
+    value=(today, today),
+    max_value=today
+)
+
+# Переводим выбранные даты в полноценный timestamp (от 00:00:00 старта до 23:59:59 конца дня)
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date = end_date = today if not isinstance(date_range, tuple) else date_range[0]
+
+start_timestamp = datetime.combine(start_date, time.min)
+end_timestamp = datetime.combine(end_date, time.max)
+
+# Подгружаем S/N устройств конкретно под выбранный период дат
+df_devices = load_devices_dynamic(st.session_state["role"], st.session_state["clinic_code"], start_timestamp, end_timestamp)
+
 # Фильтр Клиник
 if st.session_state["role"] == "admin":
-    clinic_names = ["Все"] + sorted(df_struct["clinic_name"].unique().tolist())
+    clinic_names = ["Все"] + sorted(df_struct["clinic_name"].dropna().unique().tolist())
     selected_clinic_name = st.sidebar.selectbox("Выберите клинику:", clinic_names)
     if selected_clinic_name != "Все":
-        # Берем первый элемент из массива кодов
-        selected_clinic_code = df_struct[df_struct["clinic_name"] == selected_clinic_name]["clinic_code"].values[0]
+        selected_clinic_code = df_struct[df_struct["clinic_name"] == selected_clinic_name]["clinic_code"].iloc[0]
     else:
         selected_clinic_code = "Все"
 else:
     selected_clinic_code = st.session_state["clinic_code"]
-    selected_clinic_name = df_struct["clinic_name"].unique()[0]
+    selected_clinic_name = df_struct["clinic_name"].iloc[0] if not df_struct.empty else "Ваша клиника"
     st.sidebar.info(f"Клиника: {selected_clinic_name}")
 
 # Фильтр Лабораторий
@@ -130,10 +155,11 @@ else:
 selected_lab = st.sidebar.selectbox("Выберите лабораторию:", ["Все"] + sorted(labs_list))
 
 # Фильтр Устройств
-devices_list = df_devices["device_serial"].dropna().unique().tolist()
+devices_list = df_devices["device_serial"].dropna().unique().tolist() if not df_devices.empty else []
 selected_device = st.sidebar.selectbox("Выберите устройство (S/N):", ["Все"] + sorted(devices_list))
 
-# --- ОСНОВНОЙ ЗАПРОС ---
+
+# --- ОСНОВНОЙ ЗАПРОС С ДИНАМИЧЕСКИМИ ДАТАМИ ---
 query_main = """
     SELECT 
         ate.id,
@@ -151,10 +177,10 @@ query_main = """
     FROM public.audit_trail_events ate
     LEFT JOIN public.dict_clinics dc ON ate.clinic_code = dc.clinic_code
     LEFT JOIN public.server_shipped_containers_log scl ON ate.session_id = scl.session_id
-    WHERE ate.occurred_at >= NOW() - INTERVAL '30 days'
+    WHERE ate.occurred_at BETWEEN %s AND %s
 """
 
-args = []
+args = [start_timestamp, end_timestamp]
 if selected_clinic_code != "Все":
     query_main += " AND ate.clinic_code = %s"
     args.append(selected_clinic_code)
@@ -172,6 +198,7 @@ with st.spinner("Сборка аналитики..."):
 
 # --- ОТРИСОВКА ИНТЕРФЕЙСА ДАННЫХ ---
 st.title(f"🔬 Мониторинг Биобанка: {selected_clinic_name}")
+st.caption(f"Период отчетов: {start_date.strftime('%d.%m.%Y')} — {end_date.strftime('%d.%m.%Y')}")
 
 total_events = len(df_main)
 error_events = 0
@@ -203,9 +230,12 @@ st.markdown("---")
 st.subheader("📋 Детальный журнал операций (Группировка по комплектам)")
 
 if df_main.empty:
-    st.info("За последние 30 дней операций по выбранным фильтрам не найдено.")
+    st.info("За выбранный диапазон дат операций по фильтрам не найдено.")
 else:
-    # Исправление вывода названий колонок в Pandas
+    # ❌ ТРЕБОВАНИЕ 1: Убираем колонку "Клиника" для роли клиники
+    if st.session_state["role"] != "admin" and "Клиника" in df_main.columns:
+        df_main = df_main.drop(columns=["Клиника"])
+
     unique_sessions = df_main["ID сессии (Комплект)"].dropna().unique()
     session_color_map = {session: "background-color: #f9f9f9" if i % 2 == 0 else "background-color: #ffffff" for i, session in enumerate(unique_sessions)}
     
@@ -213,10 +243,11 @@ else:
         return [session_color_map.get(row["ID сессии (Комплект)"], "")] * len(row)
         
     styled_df = df_main.style.apply(style_rows, axis=1)
-    
+        
+    # Вывод интерактивной таблицы
     st.dataframe(
         styled_df,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "id": st.column_config.NumberColumn("ID", format="%d"),
             "Время события": st.column_config.DatetimeColumn("Время события", format="DD.MM.YYYY HH:mm:ss"),
