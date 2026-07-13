@@ -2,6 +2,13 @@ import streamlit as st
 import psycopg2
 import pandas as pd
 
+# 1. СТРОГО НАЧАЛО: Инициализация сессии до любого вывода на экран
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+    st.session_state["username"] = ""
+    st.session_state["role"] = ""
+    st.session_state["clinic_code"] = ""
+
 # Настройки интерфейса
 st.set_page_config(page_title="Журнал операций лабораторий", page_icon="🔬", layout="wide")
 
@@ -10,41 +17,36 @@ if "postgres" not in st.secrets or "credentials" not in st.secrets:
     st.error("Ошибка: Файл secrets.toml не найден или заполнен неверно!")
     st.stop()
 
-# Инициализация сессии авторизации
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-    st.session_state["username"] = ""
-    st.session_state["role"] = ""
-    st.session_state["clinic_code"] = ""
-
-# --- ЭКРАН АВТОРИЗАЦИИ ---
+# --- ЭКРАН АВТОРИЗАЦИИ (Компактный по центру) ---
 if not st.session_state["authenticated"]:
-    st.title("🔒 Вход в систему")
-    
-    with st.form("login_form"):
-        username = st.text_input("Логин")
-        password = st.text_input("Пароль", type="password")
-        submit = st.form_submit_button("Войти")
+    _, col_form, _ = st.columns([1, 1.2, 1])
+    with col_form:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.title("🔒 Вход в систему")
         
-        if submit:
-            creds = st.secrets["credentials"]
-            if username in creds:
-                # Парсим строку: "password:role:clinic_code"
-                stored_pass, role, clinic_code = creds[username].split(":")
-                if password == stored_pass:
-                    st.session_state["authenticated"] = True
-                    st.session_state["username"] = username
-                    st.session_state["role"] = role
-                    st.session_state["clinic_code"] = clinic_code
-                    st.success("Успешный вход!")
-                    st.rerun()
+        with st.form("login_form"):
+            username = st.text_input("Логин")
+            password = st.text_input("Пароль", type="password")
+            submit = st.form_submit_button("Войти", use_container_width=True)
+            
+            if submit:
+                creds = st.secrets["credentials"]
+                if username in creds:
+                    stored_pass, role, clinic_code = creds[username].split(":")
+                    if password == stored_pass:
+                        # Фиксируем состояние в сессии
+                        st.session_state["authenticated"] = True
+                        st.session_state["username"] = username
+                        st.session_state["role"] = role
+                        st.session_state["clinic_code"] = clinic_code
+                        st.rerun()
+                    else:
+                        st.error("Неверный пароль")
                 else:
-                    st.error("Неверный пароль")
-            else:
-                st.error("Пользователь не найден")
+                    st.error("Пользователь не найден")
     st.stop()
 
-# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ (Нативный psycopg2) ---
+# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ (Вызывается только после логина) ---
 @st.cache_resource
 def get_connection():
     return psycopg2.connect(**st.secrets["postgres"])
@@ -55,7 +57,6 @@ except Exception as e:
     st.error(f"Ошибка подключения к базе данных: {e}")
     st.stop()
 
-# Вспомогательная функция для безопасного чтения данных в DataFrame
 def safe_query(query, params=None):
     with conn.cursor() as cur:
         cur.execute(query, params)
@@ -66,7 +67,6 @@ def safe_query(query, params=None):
 # --- ЗАГРУЗКА СПРАВОЧНИКОВ ---
 @st.cache_data(ttl=600)
 def load_filters_data(user_role, user_clinic_code):
-    # Загрузка структуры клиник и лабораторий
     if user_role == "admin":
         struct_q = """
             SELECT dc.clinic_code, dc.clinic_name, dlc.lab_code 
@@ -84,7 +84,6 @@ def load_filters_data(user_role, user_clinic_code):
         """
         df_struct = safe_query(struct_q, (user_clinic_code,))
         
-    # Загрузка доступных S/N устройств за 30 дней
     if user_role == "admin":
         dev_q = "SELECT DISTINCT device_serial FROM public.audit_trail_events WHERE occurred_at >= NOW() - INTERVAL '30 days';"
         df_devices = safe_query(dev_q)
@@ -109,11 +108,12 @@ if st.sidebar.button("🔄 Обновить данные"):
     st.cache_data.clear()
     st.rerun()
 
-# Логика фильтра Клиник
+# Фильтр Клиник
 if st.session_state["role"] == "admin":
     clinic_names = ["Все"] + sorted(df_struct["clinic_name"].unique().tolist())
     selected_clinic_name = st.sidebar.selectbox("Выберите клинику:", clinic_names)
     if selected_clinic_name != "Все":
+        # Берем первый элемент из массива кодов
         selected_clinic_code = df_struct[df_struct["clinic_name"] == selected_clinic_name]["clinic_code"].values[0]
     else:
         selected_clinic_code = "Все"
@@ -122,18 +122,18 @@ else:
     selected_clinic_name = df_struct["clinic_name"].unique()[0]
     st.sidebar.info(f"Клиника: {selected_clinic_name}")
 
-# Логика фильтра Лабораторий
+# Фильтр Лабораторий
 if selected_clinic_code != "Все":
     labs_list = df_struct[df_struct["clinic_code"] == selected_clinic_code]["lab_code"].dropna().unique().tolist()
 else:
     labs_list = df_struct["lab_code"].dropna().unique().tolist()
 selected_lab = st.sidebar.selectbox("Выберите лабораторию:", ["Все"] + sorted(labs_list))
 
-# Логика фильтра Устройств
+# Фильтр Устройств
 devices_list = df_devices["device_serial"].dropna().unique().tolist()
 selected_device = st.sidebar.selectbox("Выберите устройство (S/N):", ["Все"] + sorted(devices_list))
 
-# --- ОСНОВНОЙ ЗАПРОС ДАННЫХ (С учетом всех фильтров на уровне SQL) ---
+# --- ОСНОВНОЙ ЗАПРОС ---
 query_main = """
     SELECT 
         ate.id,
@@ -170,7 +170,7 @@ query_main += " ORDER BY ate.session_id, ate.occurred_at DESC;"
 with st.spinner("Сборка аналитики..."):
     df_main = safe_query(query_main, tuple(args))
 
-# --- РАСЧЕТ МЕТРИК ---
+# --- ОТРИСОВКА ИНТЕРФЕЙСА ДАННЫХ ---
 st.title(f"🔬 Мониторинг Биобанка: {selected_clinic_name}")
 
 total_events = len(df_main)
@@ -180,18 +180,15 @@ processed_kits = 0
 shipped_plates = 0
 
 if total_events > 0:
-    # Подсчет ошибок
     error_mask = (df_main["Статус синхр."].str.lower() != "success") & (df_main["Статус синхр."].notna()) | (df_main["Детали ошибки"].notna())
     error_events = int(error_mask.sum())
     error_rate = (error_events / total_events) * 100
     
-    # Комплекты (Уникальные вакуумные пробирки)
-    processed_kits = df_main["Баркод пробирки"].dropna().nunique()
-    
-    # Планшеты (Уникальные даты/время отгрузок)
-    shipped_plates = df_main["Время отгрузки планшета"].dropna().nunique()
+    if "Баркод пробирки" in df_main.columns:
+        processed_kits = df_main["Баркод пробирки"].dropna().nunique()
+    if "Время отгрузки планшета" in df_main.columns:
+        shipped_plates = df_main["Время отгрузки планшета"].dropna().nunique()
 
-# Отрисовка карточек
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Всего операций", f"{total_events:,}".replace(",", " "))
@@ -203,15 +200,12 @@ with col4:
     st.metric("Планшетов отгружено", shipped_plates)
 
 st.markdown("---")
-
-# --- ВИЗУАЛИЗАЦИЯ И ТАБЛИЦА ЛОГОВ ---
 st.subheader("📋 Детальный журнал операций (Группировка по комплектам)")
 
 if df_main.empty:
     st.info("За последние 30 дней операций по выбранным фильтрам не найдено.")
 else:
-    # Стилизация таблицы: поочередное окрашивание групп комплектов (session_id)
-    # Создаем маску для визуального разделения смежных комплектов
+    # Исправление вывода названий колонок в Pandas
     unique_sessions = df_main["ID сессии (Комплект)"].dropna().unique()
     session_color_map = {session: "background-color: #f9f9f9" if i % 2 == 0 else "background-color: #ffffff" for i, session in enumerate(unique_sessions)}
     
@@ -220,10 +214,9 @@ else:
         
     styled_df = df_main.style.apply(style_rows, axis=1)
     
-    # Вывод интерактивной таблицы
     st.dataframe(
         styled_df,
-        width="stretch",
+        use_container_width=True,
         column_config={
             "id": st.column_config.NumberColumn("ID", format="%d"),
             "Время события": st.column_config.DatetimeColumn("Время события", format="DD.MM.YYYY HH:mm:ss"),
